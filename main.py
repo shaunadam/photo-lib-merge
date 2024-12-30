@@ -4,8 +4,10 @@ import json
 import shutil
 import zipfile
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 import piexif
+from piexif._exceptions import InvalidImageDataError
+import pickle
 
 # ---------------------------------------------------------------------
 # Adjust these paths/configuration as needed
@@ -70,6 +72,8 @@ def find_files_recursive(base_dir):
     """
     for root, dirs, files in os.walk(base_dir):
         for fname in files:
+            if fname.startswith("."):
+                continue
             yield os.path.join(root, fname)
 
 
@@ -80,29 +84,31 @@ def get_json_date(json_path):
     Priority: photoTakenTime -> creationTime.
     If neither is available, return None.
     """
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # e.g.,
-        # {
-        #   "creationTime": {"timestamp": "1636834808"},
-        #   "photoTakenTime": {"timestamp": "1528900621"},
-        #   ...
-        # }
-        if "photoTakenTime" in data and "timestamp" in data["photoTakenTime"]:
-            ts_str = data["photoTakenTime"]["timestamp"]
-        elif "creationTime" in data and "timestamp" in data["creationTime"]:
-            ts_str = data["creationTime"]["timestamp"]
-        else:
-            return None
-
-        # Convert string timestamp to int, then to a UTC datetime
-        ts = int(ts_str)
-        dt_utc = datetime.utcfromtimestamp(ts)
-        return dt_utc
-    except Exception as e:
-        print(f"Error parsing JSON {json_path}: {e}")
+    # try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # e.g.,
+    # {
+    #   "creationTime": {"timestamp": "1636834808"},
+    #   "photoTakenTime": {"timestamp": "1528900621"},
+    #   ...
+    # }
+    if "photoTakenTime" in data and "timestamp" in data["photoTakenTime"]:
+        ts_str = data["photoTakenTime"]["timestamp"]
+    elif "creationTime" in data and "timestamp" in data["creationTime"]:
+        ts_str = data["creationTime"]["timestamp"]
+    else:
         return None
+
+    # Convert string timestamp to int, then to a UTC datetime
+    ts = int(ts_str)
+    dt_utc = datetime.fromtimestamp(ts, ZoneInfo("UTC"))
+    return dt_utc
+
+
+# except Exception as e:
+#   print(f"Error parsing JSON {json_path}: {e}")
+#  return None
 
 
 def read_exif_date(image_path):
@@ -126,28 +132,44 @@ def read_exif_date(image_path):
 
 def write_exif_date(image_path, dt):
     """
-    Write EXIF DateTimeOriginal and DateTimeDigitized from a Python datetime object.
-    dt is assumed to be local time (MST) or whichever time you want in EXIF.
+    Supplement the existing EXIF data with a 'DateTimeOriginal' (and 'DateTimeDigitized')
+    only if it's missing or invalid. We don't overwrite any existing valid date.
+
+    :param image_path: Full path to the image.
+    :param dt: A Python datetime object (assumed local time) to write if missing.
     """
     try:
         exif_dict = piexif.load(image_path)
     except Exception:
-        # If it has no EXIF segment, create minimal structure
+        # If the image has no EXIF segment, create a minimal structure
         exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
     # Format the datetime as EXIF expects: "YYYY:MM:DD HH:MM:SS"
-    dt_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+    dt_str = dt.strftime("%Y:%m:%d %H:%M:%S").encode("utf-8")
 
-    # Ensure DateTimeOriginal & DateTimeDigitized are set
-    exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str.encode("utf-8")
-    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str.encode("utf-8")
+    # Check if DateTimeOriginal is missing or set to a 'zero' placeholder
+    existing_dtorig = exif_dict["Exif"].get(piexif.ExifIFD.DateTimeOriginal, b"")
+    if not existing_dtorig or existing_dtorig == b"0000:00:00 00:00:00":
+        exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str
 
-    # If you wish, also set the 0th 'DateTime' tag
-    exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_str.encode("utf-8")
+    # Check if DateTimeDigitized is missing or set to a 'zero' placeholder
+    existing_dtdig = exif_dict["Exif"].get(piexif.ExifIFD.DateTimeDigitized, b"")
+    if not existing_dtdig or existing_dtdig == b"0000:00:00 00:00:00":
+        exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str
+
+    # Optionally, also supplement the "0th" DateTime if you want it consistent.
+    # Many apps interpret this as the file's main timestamp. If you want to leave it alone,
+    # feel free to comment out. Otherwise:
+    existing_dt0th = exif_dict["0th"].get(piexif.ImageIFD.DateTime, b"")
+    if not existing_dt0th or existing_dt0th == b"0000:00:00 00:00:00":
+        exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_str
 
     # Save updated EXIF
     exif_bytes = piexif.dump(exif_dict)
-    piexif.insert(exif_bytes, image_path)
+    try:
+        piexif.insert(exif_bytes, image_path)
+    except InvalidImageDataError:
+        print(f"Skipping file with invalid data: {image_path}")
 
 
 def get_final_date_for_file(file_path, json_date_utc):
@@ -206,10 +228,12 @@ def build_onedrive_hashmap(onedrive_dir):
         # Skip the duplicates folder
         if ONEDRIVE_DUPLICATES_DIR in fpath:
             continue
-        filehash = compute_file_hash(fpath)
-        if filehash not in onedrive_map:
-            onedrive_map[filehash] = []
-        onedrive_map[filehash].append(fpath)
+        if any((r"OneDrive\Photos" in fpath, r"OneDrive\Pictures" in fpath)):
+            filehash = compute_file_hash(fpath)
+            if filehash not in onedrive_map:
+                onedrive_map[filehash] = []
+            onedrive_map[filehash].append(fpath)
+            print(f"Created hash for {fpath}")
     return onedrive_map
 
 
@@ -221,34 +245,51 @@ def process_google_photos_and_dedupe():
     4) Move the file into a year-based folder under ORGANIZED_PHOTOS_DIR.
     5) Check for duplicates in OneDrive; move the OneDrive file(s) to duplicates if a match.
     """
-    print("Building OneDrive file hash map...")
-    onedrive_map = build_onedrive_hashmap(ONEDRIVE_DIR)
-    print(f"OneDrive map complete. Found {len(onedrive_map)} unique hashes.\n")
+    if os.path.getsize("OD.hash") > 0:
+        f = open("OD.hash", "rb")
+        onedrive_map = pickle.load(f)
+        f.close()
+    else:
+        print("Building OneDrive file hash map...")
+        onedrive_map = build_onedrive_hashmap(ONEDRIVE_DIR)
+        f = open("OD.hash", "wb")
+        pickle.dump(onedrive_map, f)
+        f.close()
+        print(f"OneDrive map complete. Found {len(onedrive_map)} unique hashes.\n")
 
     # Step A: Gather JSON metadata in a dictionary
     json_dates = {}
+    if os.path.getsize("dates.dict") > 0:
+        f = open("dates.dict", "rb")
+        json_dates = pickle.load(f)
+        f.close()
+    else:
+        print("Scanning unzipped Google Photos directory for JSON files...")
+        for fpath in find_files_recursive(UNZIPPED_TAKEOUT_DIR):
+            if fpath.lower().endswith(".json"):
+                # Potentially a Google Photos metadata file
+                base_file = fpath[:-5]  # remove ".json" to get the corresponding file
+                json_date_utc = get_json_date(fpath)
+                if json_date_utc is not None:
+                    json_dates[base_file] = json_date_utc
+                    print(base_file)
 
-    print("Scanning unzipped Google Photos directory for JSON files...")
-    for fpath in find_files_recursive(UNZIPPED_TAKEOUT_DIR):
-        if fpath.lower().endswith(".json"):
-            # Potentially a Google Photos metadata file
-            base_file = fpath[:-5]  # remove ".json" to get the corresponding file
-            json_date_utc = get_json_date(fpath)
-            if json_date_utc is not None:
-                json_dates[base_file] = json_date_utc
+        f = open("dates.dict", "wb")
+        pickle.dump(json_dates, f)
+        f.close()
 
     # Step B: For each actual file (non-JSON)
     print("Processing unzipped Google Photos files (non-JSON) and organizing...")
     for fpath in find_files_recursive(UNZIPPED_TAKEOUT_DIR):
         if fpath.lower().endswith(".json"):
             continue  # skip .json files themselves
+        if fpath.lower().endswith(".jpg"):
+            # 1. Determine JSON-based date if available
+            json_date_utc = json_dates.get(fpath)
 
-        # 1. Determine JSON-based date if available
-        json_date_utc = json_dates.get(fpath)
-
-        # 2. Read EXIF if present, else write from JSON
-        final_dt = get_final_date_for_file(fpath, json_date_utc)
-
+            # 2. Read EXIF if present, else write from JSON
+            final_dt = get_final_date_for_file(fpath, json_date_utc)
+        print(f'Moving {fpath.split('\\')[-1]}')
         # 3. Move file to year-based folder
         new_path = move_file_to_year_folder(fpath, ORGANIZED_PHOTOS_DIR, final_dt)
 
