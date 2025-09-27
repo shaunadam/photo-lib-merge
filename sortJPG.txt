@@ -1,0 +1,118 @@
+import os
+import shutil
+import piexif
+from datetime import datetime
+
+
+def get_jpg_creation_year(filepath):
+    """
+    Attempts to read a date/time tag from a JPEG's EXIF data using piexif.
+    Returns an integer year (e.g., 2024) if successful, otherwise None.
+    """
+
+    try:
+        # piexif.load() returns a dictionary of EXIF data, keyed by IFD name ("0th", "Exif", etc.)
+        exif_data = piexif.load(filepath)
+    except Exception as e:
+        print(f"Error reading EXIF from {filepath}: {e}")
+        return None
+
+    # The date/time tags we often look at:
+    #   - piexif.ExifIFD.DateTimeOriginal (36867)   -> often "YYYY:MM:DD HH:MM:SS"
+    #   - piexif.ExifIFD.DateTimeDigitized (36868)  -> same format
+    #   - piexif.ImageIFD.DateTime (306)            -> sometimes stored here
+
+    # We'll check these in a typical order.
+    # For example, if DateTimeOriginal is missing, try DateTimeDigitized, etc.
+    date_tags_exif = [piexif.ExifIFD.DateTimeOriginal, piexif.ExifIFD.DateTimeDigitized]
+    date_tags_0th = [piexif.ImageIFD.DateTime]  # stored under the '0th' IFD
+
+    # 1) Try the Exif IFD
+    for tag_id in date_tags_exif:
+        if tag_id in exif_data.get("Exif", {}):
+            # It's stored as bytes, so decode
+            date_bytes = exif_data["Exif"][tag_id]
+            if date_bytes:
+                date_str = date_bytes.decode("utf-8", errors="ignore")
+                # Usually looks like "YYYY:MM:DD HH:MM:SS"
+                year = _parse_exif_date_to_year(date_str)
+                if year is not None:
+                    return year
+
+    # 2) Try the 0th IFD
+    for tag_id in date_tags_0th:
+        if tag_id in exif_data.get("0th", {}):
+            date_bytes = exif_data["0th"][tag_id]
+            if date_bytes:
+                date_str = date_bytes.decode("utf-8", errors="ignore")
+                year = _parse_exif_date_to_year(date_str)
+                if year is not None:
+                    return year
+
+    # If all attempts fail
+    return None
+
+
+def _parse_exif_date_to_year(date_str):
+    """
+    Parses an EXIF datetime string of the form "YYYY:MM:DD HH:MM:SS"
+    and returns the year as an int, or None if it doesn't match.
+    """
+    # EXIF commonly uses "YYYY:MM:DD HH:MM:SS"
+    # We'll try just one format, but you can add more if needed.
+    try:
+        dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+        return dt.year
+    except ValueError:
+        return None
+
+
+def move_unknown_jpegs_by_exif(
+    unknown_folder=r"C:/Photos/unknown", josie_folder=r"C:/Photos"
+):
+    """
+    Scans each .jpg/.jpeg in `unknown_folder`, attempts to read EXIF date/time using piexif,
+    and moves it to `C:/Photos/Josie/YYYY` if successful, else `C:/Photos/Josie/unknown`.
+    """
+    if not os.path.exists(unknown_folder):
+        print(f"Unknown folder not found: {unknown_folder}")
+        return
+
+    if not os.path.exists(josie_folder):
+        os.makedirs(josie_folder)
+
+    for filename in os.listdir(unknown_folder):
+        # Only consider .jpg/.jpeg
+        if not filename.lower().endswith((".jpg", ".jpeg")):
+            continue
+
+        file_path = os.path.join(unknown_folder, filename)
+        if not os.path.isfile(file_path):
+            continue
+
+        # Attempt to parse the creation year from EXIF data
+        year = get_jpg_creation_year(file_path)
+
+        # If we found a valid year, set that as the subfolder; else "unknown"
+        if year is not None:
+            target_subfolder = str(year)  # e.g. "2016"
+        else:
+            target_subfolder = "unknown"
+
+        # Create the destination subfolder if necessary
+        dest_folder = os.path.join(josie_folder, target_subfolder)
+        if not os.path.exists(dest_folder):
+            os.makedirs(dest_folder)
+
+        dest_path = os.path.join(dest_folder, filename)
+
+        # Move the file
+        try:
+            shutil.move(file_path, dest_path)
+            print(f"Moved {file_path} -> {dest_path}")
+        except Exception as e:
+            print(f"Error moving file {file_path}: {e}")
+
+
+if __name__ == "__main__":
+    move_unknown_jpegs_by_exif()

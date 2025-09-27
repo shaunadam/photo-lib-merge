@@ -24,6 +24,8 @@ UNZIPPED_TAKEOUT_DIR = r"C:\Users\shaun\Downloads\Takeout\Unzipped"
 #    (where we place yearly or unknown folders)
 ORGANIZED_PHOTOS_DIR = r"C:\Photos"
 
+JSON_BACKUPS_DIR = r"C:\JSON_Backups"
+
 # 4. Your OneDrive root folder
 ONEDRIVE_DIR = r"C:\Users\shaun\OneDrive"
 
@@ -57,6 +59,16 @@ def compute_file_hash(filepath, chunk_size=65536):
     Compute an MD5 hash of a file’s contents.
     """
     md5 = hashlib.md5()
+    try:
+        with open(filepath, "rb") as f:
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                md5.update(data)
+    except Exception as e:
+        print(f"Error hashing file {filepath}: {e}")
+        return None
     with open(filepath, "rb") as f:
         while True:
             data = f.read(chunk_size)
@@ -214,7 +226,11 @@ def move_file_to_year_folder(file_path, base_output_dir, dt):
     new_path = os.path.join(target_dir, filename)
 
     # Move (not copy) so we don't leave duplicates behind
-    shutil.move(file_path, new_path)
+    try:
+        shutil.move(file_path, new_path)
+    except Exception as e:
+        print(f"Error moving file: {e}")
+        pass
     return new_path
 
 
@@ -289,8 +305,11 @@ def process_google_photos_and_dedupe():
 
             # 2. Read EXIF if present, else write from JSON
             final_dt = get_final_date_for_file(fpath, json_date_utc)
-        print(f'Moving {fpath.split('\\')[-1]}')
-        # 3. Move file to year-based folder
+            print(f'Moving {fpath.split('\\')[-1]}')
+            # 3. Move file to year-based folder
+
+        else:
+            final_dt = get_final_date_for_file(fpath, None)
         new_path = move_file_to_year_folder(fpath, ORGANIZED_PHOTOS_DIR, final_dt)
 
         # 4. Check duplicates in OneDrive
@@ -302,10 +321,27 @@ def process_google_photos_and_dedupe():
                 duplicates_target = os.path.join(ONEDRIVE_DUPLICATES_DIR, rel_name)
                 os.makedirs(ONEDRIVE_DUPLICATES_DIR, exist_ok=True)
                 print(f"Moving OneDrive duplicate to {duplicates_target}")
-                shutil.move(dup_path, duplicates_target)
+                try:
+                    shutil.move(dup_path, duplicates_target)
+                except Exception as e:
+                    print(f"Error moving OneDrive duplicate: {e}")
+                    pass
 
             # Remove that hash from the map to avoid re-checking
             del onedrive_map[new_file_hash]
+
+
+def backup_json():
+    os.makedirs(JSON_BACKUPS_DIR, exist_ok=True)
+    for fpath in find_files_recursive(UNZIPPED_TAKEOUT_DIR):
+        if fpath.lower().endswith(".json"):
+            filename = os.path.basename(fpath)
+            new_path = os.path.join(JSON_BACKUPS_DIR, filename)
+            try:
+                shutil.move(fpath, new_path)
+            except Exception as e:
+                print(f"Error moving file: {e}")
+                pass
 
 
 def main():
@@ -325,8 +361,10 @@ def main():
     # 3) Process Google Photos and remove duplicates in OneDrive
     print("Starting Google Photos processing and OneDrive deduplication...")
     process_google_photos_and_dedupe()
+
     print("\nAll done!")
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    backup_json()
